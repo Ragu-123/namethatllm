@@ -5,6 +5,11 @@ import shutil
 
 print("=== OPERA Modular Pipeline Runner on Kaggle ===", flush=True)
 
+# 1. Unload any previously imported opera modules from kernel memory
+for mod in list(sys.modules.keys()):
+    if mod.startswith("opera"):
+        del sys.modules[mod]
+
 REPO_URL = "https://github.com/Ragu-123/namethatllm.git"
 CLONE_DIR = "/kaggle/working/namethatllm" if os.path.exists("/kaggle/working") else "./namethatllm_clone"
 
@@ -17,7 +22,7 @@ for stale in ["/kaggle/working/qwen_train_emb.npz", "/kaggle/working/qwen_test_e
         except Exception:
             pass
 
-# 1. Clone or update repository from GitHub
+# 2. Clone or update repository from GitHub
 if not os.path.exists(CLONE_DIR):
     print(f"Cloning repository from {REPO_URL} into {CLONE_DIR}...", flush=True)
     res = subprocess.run(["git", "clone", "--depth", "1", REPO_URL, CLONE_DIR], capture_output=True, text=True)
@@ -26,17 +31,18 @@ if not os.path.exists(CLONE_DIR):
     else:
         print(">> Repository successfully cloned from GitHub!", flush=True)
 else:
-    print(f"Repository directory {CLONE_DIR} already exists. Pulling latest from GitHub...", flush=True)
-    res = subprocess.run(["git", "-C", CLONE_DIR, "pull"], capture_output=True, text=True)
-    print(f"Git pull output: {res.stdout.strip()}", flush=True)
+    print(f"Repository directory {CLONE_DIR} already exists. Fetching and resetting to latest origin/main...", flush=True)
+    subprocess.run(["git", "-C", CLONE_DIR, "fetch", "origin", "main"], capture_output=True, text=True)
+    res = subprocess.run(["git", "-C", CLONE_DIR, "reset", "--hard", "origin/main"], capture_output=True, text=True)
+    print(f"Git reset output: {res.stdout.strip()}", flush=True)
 
-# 2. Add repo to Python path
+# 3. Add repo to Python path
 if os.path.exists(CLONE_DIR):
     if CLONE_DIR not in sys.path:
         sys.path.insert(0, CLONE_DIR)
     print(f"Added {CLONE_DIR} to sys.path", flush=True)
 
-# 3. Auto-detect data and model directories
+# 4. Auto-detect data and model directories
 data_candidates = [
     '/kaggle/input/competitions/name-that-llm',
     '/kaggle/input/name-that-llm',
@@ -59,7 +65,7 @@ print(f"  Data Directory: {data_dir}")
 print(f"  Qwen 3 Directory: {qwen_dir}")
 print(f"  Output Directory: {out_dir}")
 
-# 4. Import modular OPERA pipeline and execute
+# 5. Import modular OPERA pipeline and execute
 from opera.pipeline import run_opera_pipeline
 
 print("\nStarting execution of modular OPERA pipeline with verified Qwen 3 embeddings...", flush=True)

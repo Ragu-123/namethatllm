@@ -116,9 +116,9 @@ def run_opera_pipeline(data_dir, qwen_dir=None, output_dir=".", use_neural=True)
 
         if has_qwen:
             scaler_q = StandardScaler()
-            Q_tr = scaler_q.fit_transform(Qwen_tr_raw[tr_idx])
-            Q_va = scaler_q.transform(Qwen_tr_raw[va_idx])
-            Q_te = scaler_q.transform(Qwen_te_raw)
+            Q_tr = scaler_q.fit_transform(np.clip(Qwen_tr_raw[tr_idx], -1e4, 1e4))
+            Q_va = scaler_q.transform(np.clip(Qwen_tr_raw[va_idx], -1e4, 1e4))
+            Q_te = scaler_q.transform(np.clip(Qwen_te_raw, -1e4, 1e4))
             Dense_tr = np.hstack([S_tr, A_tr, Q_tr * 0.4])
             Dense_va = np.hstack([S_va, A_va, Q_va * 0.4])
             Dense_te = np.hstack([S_te, A_te, Q_te * 0.4])
