@@ -2,29 +2,31 @@ import os
 import re
 import sys
 import time
-import socket
+import json
 import numpy as np
 import pandas as pd
 from collections import Counter
 from scipy import sparse
 from scipy.linalg import eigh
 from scipy.special import softmax
-from scipy.optimize import minimize
 from sklearn.model_selection import GroupKFold
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler, normalize
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import LinearSVC
 from sklearn.metrics import balanced_accuracy_score, recall_score
+import torch
+from transformers import AutoConfig, AutoTokenizer, AutoModel
 
-print("=== OPERA v3.0: RKHS Non-Linear Kernel-FOSP + CPNL LogOP + Analytic-ASTD ===", flush=True)
+print("=== OPERA v4.0: Neural FOSP (Qwen 3 1.7B Layers 17 & 20) + RKHS Kernel-FOSP + CPNL LogOP ===", flush=True)
 t_start = time.time()
 
 # 1. Environment & Hardware Discovery
 print("\n--- System & Hardware Discovery ---", flush=True)
 print(f"Python: {sys.version.split()[0]}", flush=True)
-if os.path.exists("/kaggle/input"):
-    print(f"Available in /kaggle/input: {os.listdir('/kaggle/input')}", flush=True)
+print(f"PyTorch: {torch.__version__}, CUDA Available: {torch.cuda.is_available()}", flush=True)
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB)", flush=True)
 
 # 2. Locate Data Directory
 data_candidates = [
@@ -40,7 +42,17 @@ train_df = pd.read_csv(f"{DATA_DIR}/train.csv")
 test_df = pd.read_csv(f"{DATA_DIR}/test.csv")
 print(f"Train: {train_df.shape}, Test: {test_df.shape}", flush=True)
 
-# 3. Provider Taxonomy & Class Mapping
+# 3. Locate Qwen 3 (1.7B-Base) Model Directory
+qwen_candidates = [
+    "/kaggle/input/models/qwen-lm/qwen-3/transformers/1.7b-base/1",
+    "/kaggle/input/qwen-3/transformers/1.7b-base/1",
+]
+QWEN_DIR = next((p for p in qwen_candidates if os.path.exists(os.path.join(p, 'config.json'))), None)
+if QWEN_DIR is None:
+    raise FileNotFoundError("Could not locate Qwen 3 (1.7B-Base) model directory!")
+print(f"Using Qwen 3 Model from: {QWEN_DIR}", flush=True)
+
+# 4. Provider Taxonomy & Class Mapping
 PROVIDER_MAP = {
     "claude-fable-5": "Anthropic",
     "claude-opus-4-6": "Anthropic",
@@ -74,7 +86,65 @@ TOKEN_RE = re.compile(r"(?u)\b\w+\b|[^\w\s]")
 SYLLABLE_RE = re.compile(r"[aeiouyAEIOUY]+")
 MAJOR_PUNCT = {"—", "–", ";", ":", ",", "(", ")"}
 
-# 4. Stylometric Feature Extractor (54 Fine-Grained Dimensions)
+# 5. Extract Qwen 3 Layers 17 & 20 Hidden States with Disk Caching
+def extract_qwen_features(texts, model_dir, cache_path=None, batch_size=16, max_length=512):
+    if cache_path and os.path.exists(cache_path):
+        print(f"Loading cached Qwen representations from {cache_path}...", flush=True)
+        data = np.load(cache_path)
+        return data["h17"], data["h20"]
+
+    print(f"Extracting Qwen 3 representations ({len(texts)} passages, batch_size={batch_size})...", flush=True)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModel.from_pretrained(
+        model_dir,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map={"": device} if torch.cuda.is_available() else None,
+        output_hidden_states=True
+    )
+    model.eval()
+
+    h17_list = []
+    h20_list = []
+
+    with torch.no_grad():
+        for start_idx in range(0, len(texts), batch_size):
+            batch_texts = texts[start_idx : start_idx + batch_size]
+            encoded = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt"
+            ).to(device)
+
+            outputs = model(**encoded, output_hidden_states=True)
+            mask = encoded["attention_mask"].unsqueeze(-1)
+            
+            # Layer 17 mean-pooling
+            layer17 = outputs.hidden_states[17]
+            p17 = (layer17 * mask).sum(dim=1) / mask.sum(dim=1)
+            h17_list.append(p17.cpu().to(torch.float32).numpy())
+
+            # Layer 20 mean-pooling
+            layer20 = outputs.hidden_states[20]
+            p20 = (layer20 * mask).sum(dim=1) / mask.sum(dim=1)
+            h20_list.append(p20.cpu().to(torch.float32).numpy())
+
+    h17_all = np.vstack(h17_list)
+    h20_all = np.vstack(h20_list)
+
+    if cache_path:
+        np.savez_compressed(cache_path, h17=h17_all, h20=h20_all)
+        print(f"Cached Qwen representations saved to {cache_path}", flush=True)
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return h17_all, h20_all
+
+# 6. Stylometric Feature Extractor (54 Fine-Grained Dimensions)
 def extract_stylometric_matrix(texts):
     FUNCTION_WORDS = [
         "the", "and", "of", "to", "in", "is", "that", "it", "for", "as",
@@ -173,7 +243,7 @@ def extract_stylometric_matrix(texts):
         feats.append(row)
     return np.asarray(feats, dtype=np.float32)
 
-# 5. Pillar 3: Analytic Zero-GPU Contrastive ASTD (32 Features)
+# 7. Analytic Contrastive ASTD (32 Features)
 class AnalyticContrastiveASTD:
     def __init__(self):
         self.uni_base = Counter()
@@ -293,7 +363,7 @@ class AnalyticContrastiveASTD:
             ]
         return np.nan_to_num(feats, 0.0)
 
-# 6. Pillar 1: Non-Linear Kernel-FOSP via Exact RKHS Double-Centering
+# 8. Non-Linear Kernel-FOSP via Exact RKHS Double-Centering
 class NonLinearKernelFOSP:
     def __init__(self, n_components=32, lam_p_ratio=6.67, gamma_rel=0.06, rbf_gamma=2.0):
         self.n_components = n_components
@@ -350,7 +420,7 @@ class NonLinearKernelFOSP:
         gamma = self.gamma_rel * (np.trace(B_comb) / max(np.trace(K_c), 1e-12))
         B_dual = B_comb + gamma * K_c
 
-        # Robust Eigendecomposition of B_dual (bypasses Cholesky LinAlgError)
+        # Robust Eigendecomposition bypasses Cholesky LinAlgError
         A_dual = 0.5 * (A_dual + A_dual.T)
         B_dual = 0.5 * (B_dual + B_dual.T)
 
@@ -385,7 +455,7 @@ class NonLinearKernelFOSP:
         Z_te = (K_te_tr @ self.Alpha_tilde) - self.b_kern[None, :]
         return Z_te.astype(np.float32)
 
-# 7. Pillar 2: CPNL Logarithmic Opinion Pool (LogOP) for Tier-1 Provider Routing
+# 9. CPNL Logarithmic Opinion Pool (LogOP) for Tier-1 Provider Routing
 class CPNLProviderLogOP:
     def __init__(self, n_providers=6, alpha_char=0.5, alpha_punct=0.25):
         self.n_providers = n_providers
@@ -489,7 +559,7 @@ class CPNLProviderLogOP:
         logits = log_disc + self.eta_char * bc_norm + self.eta_punct * bp_norm
         return softmax(logits, axis=1)
 
-# 8. Pillar 4: Scale-Free Laplacian Topic Centering (Top-17 Capped + Kish's Neff Shrinkage)
+# 10. Scale-Free Laplacian Topic Centering
 def scale_free_laplacian_center(X_test, texts_test, train_texts=None, k_max=17, sim_tau=0.18, beta=4.0, kappa=2.5, chunk_size=1024):
     n_test = len(texts_test)
     if n_test <= 1:
@@ -561,7 +631,7 @@ def scale_free_laplacian_center(X_test, texts_test, train_texts=None, k_max=17, 
             X_out[i] = rho[i] * X_test[i]
     return X_out
 
-# 9. Group Centering Functions (Training & Validation)
+# 11. Group Centering Functions
 def group_center_sparse(X, groups):
     df_g = pd.DataFrame({"g": groups})
     codes, uniques = pd.factorize(df_g["g"])
@@ -586,7 +656,7 @@ def group_center_dense(X, groups):
             X_out[indices] -= X_out[indices].mean(axis=0, keepdims=True)
     return X_out
 
-# 10. Cardinality-Compensated Temperature Scaling & Marginal Prior Normalization
+# 12. Cardinality Temperature Scaling & Marginal Prior Normalization
 def calibrated_tier2_proba(probs, cluster_size, beta=0.35):
     if cluster_size <= 1:
         return np.ones((probs.shape[0], 1), dtype=np.float64)
@@ -607,7 +677,7 @@ def normalize_hierarchical_marginals(oof_hier, test_hier, tau=0.65, alpha_dirich
     test_cal /= test_cal.sum(axis=1, keepdims=True)
     return oof_cal, test_cal
 
-# 11. Metric-Direct Coordinate-Ascent Prior Optimizer
+# 13. Metric-Direct Coordinate-Ascent Prior Optimizer
 def optimize_class_offsets(oof_probs, y_true, n_rounds=4):
     log_p = np.log(np.clip(oof_probs, 1e-7, 1.0))
     offsets = np.zeros(oof_probs.shape[1], dtype=np.float64)
@@ -630,19 +700,34 @@ def optimize_class_offsets(oof_probs, y_true, n_rounds=4):
             break
     return offsets, best_ba
 
-# 12. Main Pipeline Execution
-print("\n--- Phase 1: Feature Extraction (Stylometrics + Analytic-ASTD + TF-IDF) ---", flush=True)
+# 14. Phase 1: Feature Extraction
+print("\n--- Phase 1: Feature Extraction ---", flush=True)
+
+# A. Neural Features: Qwen 3 (1.7B-Base) Layers 17 & 20
+work_dir = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
+cache_tr = os.path.join(work_dir, "qwen_train_emb.npz")
+cache_te = os.path.join(work_dir, "qwen_test_emb.npz")
+
+qwen_h17_tr, qwen_h20_tr = extract_qwen_features(train_df["text"].tolist(), QWEN_DIR, cache_path=cache_tr, batch_size=16)
+qwen_h17_te, qwen_h20_te = extract_qwen_features(test_df["text"].tolist(), QWEN_DIR, cache_path=cache_te, batch_size=16)
+
+Qwen_tr_raw = np.hstack([qwen_h17_tr, qwen_h20_tr])
+Qwen_te_raw = np.hstack([qwen_h17_te, qwen_h20_te])
+print(f">> Qwen 3 (Layers 17+20) Extracted: train={Qwen_tr_raw.shape}, test={Qwen_te_raw.shape}", flush=True)
+
+# B. Stylometric Features (83 dims)
 X_style_tr_raw = extract_stylometric_matrix(train_df["text"].tolist())
 X_style_te_raw = extract_stylometric_matrix(test_df["text"].tolist())
-print(f"Stylometrics extracted: train={X_style_tr_raw.shape}, test={X_style_te_raw.shape}", flush=True)
+print(f">> Stylometrics Extracted: train={X_style_tr_raw.shape}, test={X_style_te_raw.shape}", flush=True)
 
-print("Extracting 32-dim Analytic Contrastive ASTD features...", flush=True)
+# C. Analytic Contrastive ASTD (32 dims)
 astd_model = AnalyticContrastiveASTD()
 astd_model.fit(train_df["text"].tolist())
 X_astd_tr_raw = astd_model.transform(train_df["text"].tolist())
 X_astd_te_raw = astd_model.transform(test_df["text"].tolist())
-print(f"Analytic-ASTD extracted: train={X_astd_tr_raw.shape}, test={X_astd_te_raw.shape}", flush=True)
+print(f">> Analytic-ASTD Extracted: train={X_astd_tr_raw.shape}, test={X_astd_te_raw.shape}", flush=True)
 
+# D. Hellinger Sublinear TF-IDF (132k dims)
 char_vec = TfidfVectorizer(
     analyzer="char_wb", ngram_range=(1, 5), min_df=2, max_features=180000,
     sublinear_tf=True, lowercase=False
@@ -654,18 +739,17 @@ word_vec = TfidfVectorizer(
 
 X_char_tr = char_vec.fit_transform(train_df["text"])
 X_char_te = char_vec.transform(test_df["text"])
-
 X_word_tr = word_vec.fit_transform(train_df["text"])
 X_word_te = word_vec.transform(test_df["text"])
 
-# Hellinger Transform on TF-IDF (Square-Root Preconditioning)
 X_tfidf_tr = sparse.hstack([X_char_tr, X_word_tr], format="csr")
 X_tfidf_te = sparse.hstack([X_char_te, X_word_te], format="csr")
 
 X_tfidf_tr.data = np.sqrt(np.maximum(X_tfidf_tr.data, 0.0))
 X_tfidf_te.data = np.sqrt(np.maximum(X_tfidf_te.data, 0.0))
-print(f"Total Hellinger TF-IDF Space: {X_tfidf_tr.shape[1]:,} features", flush=True)
+print(f">> Total Hellinger TF-IDF Space: {X_tfidf_tr.shape[1]:,} features", flush=True)
 
+# 15. Cross-Validation Setup
 y_all = np.array([CLASS_TO_IDX[m] for m in train_df["model"]])
 prov_all = np.array([PROV_TO_IDX[PROVIDER_MAP[m]] for m in train_df["model"]])
 prompts_all = train_df["prompt_id"].values
@@ -676,14 +760,16 @@ folds = list(gkf.split(train_df, y_all, groups=prompts_all))
 oof_global_lr = np.zeros((len(train_df), len(CLASSES)), dtype=np.float64)
 oof_global_svc = np.zeros((len(train_df), len(CLASSES)), dtype=np.float64)
 oof_nl_fosp = np.zeros((len(train_df), len(CLASSES)), dtype=np.float64)
+oof_qwen_head = np.zeros((len(train_df), len(CLASSES)), dtype=np.float64)
 oof_hier = np.zeros((len(train_df), len(CLASSES)), dtype=np.float64)
 
 test_global_lr = np.zeros((len(test_df), len(CLASSES)), dtype=np.float64)
 test_global_svc = np.zeros((len(test_df), len(CLASSES)), dtype=np.float64)
 test_nl_fosp = np.zeros((len(test_df), len(CLASSES)), dtype=np.float64)
+test_qwen_head = np.zeros((len(test_df), len(CLASSES)), dtype=np.float64)
 test_hier = np.zeros((len(test_df), len(CLASSES)), dtype=np.float64)
 
-print("\n--- Commencing 5-Fold Grouped Cross-Validation (OPERA v3.0) ---", flush=True)
+print("\n--- Commencing 5-Fold Grouped Cross-Validation (OPERA v4.0) ---", flush=True)
 
 for fold, (tr_idx, va_idx) in enumerate(folds):
     t_f_start = time.time()
@@ -691,7 +777,7 @@ for fold, (tr_idx, va_idx) in enumerate(folds):
     va_prompts = prompts_all[va_idx]
     assert len(set(tr_prompts) & set(va_prompts)) == 0, f"Prompt leakage in fold {fold}!"
 
-    # 1. Feature Standardization & Prompt Centering
+    # 1. Feature Normalization & Centering
     scaler_s = StandardScaler()
     S_tr = scaler_s.fit_transform(X_style_tr_raw[tr_idx])
     S_va = scaler_s.transform(X_style_tr_raw[va_idx])
@@ -702,19 +788,26 @@ for fold, (tr_idx, va_idx) in enumerate(folds):
     A_va = scaler_a.transform(X_astd_tr_raw[va_idx])
     A_te = scaler_a.transform(X_astd_te_raw)
 
-    # Combined Dense Stylometrics + ASTD
-    Dense_tr = np.hstack([S_tr, A_tr])
-    Dense_va = np.hstack([S_va, A_va])
-    Dense_te = np.hstack([S_te, A_te])
+    scaler_q = StandardScaler()
+    Q_tr = scaler_q.fit_transform(Qwen_tr_raw[tr_idx])
+    Q_va = scaler_q.transform(Qwen_tr_raw[va_idx])
+    Q_te = scaler_q.transform(Qwen_te_raw)
+
+    # Dense prompt-centering
+    Dense_tr = np.hstack([S_tr, A_tr, Q_tr * 0.4])
+    Dense_va = np.hstack([S_va, A_va, Q_va * 0.4])
+    Dense_te = np.hstack([S_te, A_te, Q_te * 0.4])
 
     D_tr_c = group_center_dense(Dense_tr, tr_prompts)
     D_va_c = group_center_dense(Dense_va, va_prompts)
     D_te_c = scale_free_laplacian_center(Dense_te, test_df["text"].tolist(), train_texts=train_df["text"].tolist())
 
+    # Sparse TF-IDF prompt-centering
     T_tr_c = group_center_sparse(X_tfidf_tr[tr_idx], tr_prompts)
     T_va_c = group_center_sparse(X_tfidf_tr[va_idx], va_prompts)
     T_te_c = scale_free_laplacian_center(X_tfidf_te, test_df["text"].tolist(), train_texts=train_df["text"].tolist())
 
+    # Stack into unified space
     X_tr_comb = sparse.hstack([T_tr_c, sparse.csr_matrix(D_tr_c * 0.25)], format="csr")
     X_va_comb = sparse.hstack([T_va_c, sparse.csr_matrix(D_va_c * 0.25)], format="csr")
     X_te_comb = sparse.hstack([T_te_c, sparse.csr_matrix(D_te_c * 0.25)], format="csr")
@@ -723,7 +816,7 @@ for fold, (tr_idx, va_idx) in enumerate(folds):
     X_va_norm = normalize(X_va_comb, norm="l2")
     X_te_norm = normalize(X_te_comb, norm="l2")
 
-    # 2. Global Logistic Regression Head (High-Dimensional L2)
+    # 2. Global Logistic Regression Head
     clf_lr = LogisticRegression(C=2.5, max_iter=1000, random_state=42 + fold)
     clf_lr.fit(X_tr_norm, y_all[tr_idx])
     oof_global_lr[va_idx] = clf_lr.predict_proba(X_va_norm)
@@ -737,8 +830,8 @@ for fold, (tr_idx, va_idx) in enumerate(folds):
     oof_global_svc[va_idx] = softmax(svc_va_dec / 1.5, axis=1)
     test_global_svc += softmax(svc_te_dec / 1.5, axis=1) / len(folds)
 
-    # 4. Non-Linear Kernel-FOSP (Polynomial-Cosine + RBF Mixture in RKHS)
-    nl_fosp = NonLinearKernelFOSP(n_components=32, lam_p_ratio=6.67, gamma_rel=0.06, rbf_gamma=2.0)
+    # 4. Non-Linear Kernel-FOSP in RKHS
+    nl_fosp = NonLinearKernelFOSP(n_components=36, lam_p_ratio=6.67, gamma_rel=0.06, rbf_gamma=2.0)
     Z_tr = nl_fosp.fit_transform(X_tr_comb, tr_prompts, y_all[tr_idx])
     Z_va = nl_fosp.transform(X_va_comb)
     Z_te = nl_fosp.transform(X_te_comb)
@@ -753,7 +846,17 @@ for fold, (tr_idx, va_idx) in enumerate(folds):
     oof_nl_fosp[va_idx] = clf_fosp.predict_proba(Z_va)
     test_nl_fosp += clf_fosp.predict_proba(Z_te) / len(folds)
 
-    # 5. CPNL LogOP Tier-1 Provider Router
+    # 5. Specialized Neural Qwen Centered Head
+    Q_tr_c = group_center_dense(Q_tr, tr_prompts)
+    Q_va_c = group_center_dense(Q_va, va_prompts)
+    Q_te_c = scale_free_laplacian_center(Q_te, test_df["text"].tolist(), train_texts=train_df["text"].tolist())
+
+    clf_qwen = LogisticRegression(C=0.015, max_iter=1000, random_state=42 + fold)
+    clf_qwen.fit(Q_tr_c, y_all[tr_idx])
+    oof_qwen_head[va_idx] = clf_qwen.predict_proba(Q_va_c)
+    test_qwen_head += clf_qwen.predict_proba(Q_te_c) / len(folds)
+
+    # 6. CPNL LogOP Tier-1 Provider Router
     clf_tier1 = LogisticRegression(C=2.0, max_iter=1000, random_state=42 + fold)
     clf_tier1.fit(X_tr_norm, prov_all[tr_idx])
     prov_probs_va_disc = clf_tier1.predict_proba(X_va_norm)
@@ -767,7 +870,7 @@ for fold, (tr_idx, va_idx) in enumerate(folds):
     prov_probs_va = cpnl_router.fuse_proba(prov_probs_va_disc, b_c_va, b_p_va, g_va)
     prov_probs_te = cpnl_router.fuse_proba(prov_probs_te_disc, b_c_te, b_p_te, g_te)
 
-    # 6. Tier-2 Specialized Intra-Family Resolvers with Cardinality Temperature Scaling
+    # 7. Tier-2 Specialized Intra-Family Resolvers
     fold_hier_va = np.zeros((len(va_idx), len(CLASSES)), dtype=np.float64)
     fold_hier_te = np.zeros((len(test_df), len(CLASSES)), dtype=np.float64)
 
@@ -806,38 +909,41 @@ for fold, (tr_idx, va_idx) in enumerate(folds):
 
     # Fold Blend Metric
     fold_blend = (
-        0.30 * oof_global_lr[va_idx]
-        + 0.20 * oof_global_svc[va_idx]
-        + 0.25 * oof_nl_fosp[va_idx]
-        + 0.25 * oof_hier[va_idx]
+        0.25 * oof_global_lr[va_idx]
+        + 0.15 * oof_global_svc[va_idx]
+        + 0.20 * oof_nl_fosp[va_idx]
+        + 0.20 * oof_qwen_head[va_idx]
+        + 0.20 * oof_hier[va_idx]
     )
     fold_ba = balanced_accuracy_score(y_all[va_idx], np.argmax(fold_blend, axis=1))
     print(f"  Fold {fold + 1}/5 Balanced Accuracy: {fold_ba:.5f} (Elapsed: {time.time() - t_f_start:.1f}s)", flush=True)
 
-# 13. Global Dirichlet-Smoothed Marginal Prior Normalization
+# 16. Global Dirichlet-Smoothed Marginal Prior Normalization
 oof_hier_norm, test_hier_norm = normalize_hierarchical_marginals(oof_hier, test_hier, tau=0.65)
 
 oof_ensemble = (
-    0.30 * oof_global_lr
-    + 0.20 * oof_global_svc
-    + 0.25 * oof_nl_fosp
-    + 0.25 * oof_hier_norm
+    0.25 * oof_global_lr
+    + 0.15 * oof_global_svc
+    + 0.20 * oof_nl_fosp
+    + 0.20 * oof_qwen_head
+    + 0.20 * oof_hier_norm
 )
 test_ensemble = (
-    0.30 * test_global_lr
-    + 0.20 * test_global_svc
-    + 0.25 * test_nl_fosp
-    + 0.25 * test_hier_norm
+    0.25 * test_global_lr
+    + 0.15 * test_global_svc
+    + 0.20 * test_nl_fosp
+    + 0.20 * test_qwen_head
+    + 0.20 * test_hier_norm
 )
 
 raw_ba = balanced_accuracy_score(y_all, np.argmax(oof_ensemble, axis=1))
 print(f"\n>> Raw 5-Fold OOF Balanced Accuracy: {raw_ba:.5f}", flush=True)
 
-# 14. Prior Calibration via Coordinate Ascent on Balanced Accuracy
+# 17. Prior Calibration via Coordinate Ascent
 best_offsets, cal_ba = optimize_class_offsets(oof_ensemble, y_all, n_rounds=4)
 print(f">> Calibrated 5-Fold OOF Balanced Accuracy: {cal_ba:.5f} (Net Gain: {cal_ba - raw_ba:+.4f})", flush=True)
 
-# 15. Per-Model Recall Breakdown
+# 18. Per-Model Recall Breakdown
 oof_final_preds = np.argmax(np.log(np.clip(oof_ensemble, 1e-7, 1.0)) + best_offsets[None, :], axis=1)
 recalls = recall_score(y_all, oof_final_preds, average=None)
 print("\nPer-Model Recall Breakdown:", flush=True)
@@ -845,7 +951,7 @@ rec_series = pd.Series(recalls, index=CLASSES).sort_values()
 for m_name, r_val in rec_series.items():
     print(f"  {m_name:24s}: {r_val:.4f}", flush=True)
 
-# 16. Write and Verify submission.parquet
+# 19. Write and Verify submission.parquet
 test_final_idx = np.argmax(np.log(np.clip(test_ensemble, 1e-7, 1.0)) + best_offsets[None, :], axis=1)
 test_pred_labels = [IDX_TO_CLASS[i] for i in test_final_idx]
 
@@ -863,4 +969,4 @@ assert len(check_sub) == len(test_df)
 assert check_sub["model"].isin(CLASSES).all()
 print("Verification passed! Preview of submission:", flush=True)
 print(check_sub.head(), flush=True)
-print(f"\n=== Total OPERA v3.0 Pipeline Execution Time: {time.time() - t_start:.1f}s ===", flush=True)
+print(f"\n=== Total OPERA v4.0 Pipeline Execution Time: {time.time() - t_start:.1f}s ===", flush=True)
