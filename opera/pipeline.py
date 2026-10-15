@@ -71,8 +71,8 @@ def run_opera_pipeline(data_dir, qwen_dir=None, output_dir=".", use_neural=True)
         cache_te = os.path.join(output_dir, "qwen_test_emb.npz")
         qwen_h17_tr, qwen_h20_tr = extract_qwen_features(train_df["text"].tolist(), qwen_dir, cache_path=cache_tr)
         qwen_h17_te, qwen_h20_te = extract_qwen_features(test_df["text"].tolist(), qwen_dir, cache_path=cache_te)
-        Qwen_tr_raw = np.hstack([qwen_h17_tr, qwen_h20_tr])
-        Qwen_te_raw = np.hstack([qwen_h17_te, qwen_h20_te])
+        Qwen_tr_raw = np.nan_to_num(np.hstack([qwen_h17_tr, qwen_h20_tr]), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        Qwen_te_raw = np.nan_to_num(np.hstack([qwen_h17_te, qwen_h20_te]), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         print(f"Qwen representations: train={Qwen_tr_raw.shape}, test={Qwen_te_raw.shape}", flush=True)
         has_qwen = True
 
